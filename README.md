@@ -99,14 +99,35 @@ This catches bugs that a single model would miss. In practice, 100% of steps req
 
 ## Real-World Results
 
-Built and tested on the [Protocore](https://github.com/ascorblack-labs) ecosystem:
+Built and tested on the [Protocore](https://github.com/ascorblack-labs) ecosystem — a multi-repo Python AI orchestration platform:
 
-- **363 bugs found** across 2 Python repositories (10 Critical, 76 High, 245 Medium, 32 Low)
+- **363 bugs found** across 2 repositories (10 Critical, 76 High, 245 Medium, 32 Low)
 - **86 bugs fixed** automatically (10 Critical + 76 High) in ~10.5 hours
 - **5,748 tests passing** across both repos (0 failures)
 - **302 source files** type-checked with 0 errors
 - **~52 commits** generated (implementation + review fixes)
 - **Review loop** caught real issues in 100% of steps; avg 2.8 iterations to PASS
+
+<details>
+<summary>Detailed metrics</summary>
+
+| Metric | Value |
+|--------|-------|
+| Total bugs fixed | 86 (10 Critical + 76 High) |
+| Total pipeline time | ~10.5 hours |
+| Steps (batches) | 12 (8 core repo + 4 enterprise repo) |
+| Total commits | ~52 |
+| Tests passing | 5,748 (3,629 core + 2,119 enterprise) |
+| Source files type-checked | 302 (93 core + 209 enterprise) |
+| Steps needing review fixes | 12/12 (100%) |
+| Steps hitting max iterations | 5/12 (42%) |
+| Steps passing after gap closure | 12/12 (100%) |
+| Average Claude implementation time | ~15 min |
+| Average review iterations to PASS | 2.8 |
+| Security bugs (SSRF) review depth | 5 iterations (IPv6-mapped, DNS rebinding, hostname whitelists) |
+| API outage recovery | 2 steps restarted after HTTP 500 |
+
+</details>
 
 ## Customization
 

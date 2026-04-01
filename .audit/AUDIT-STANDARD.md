@@ -12,8 +12,7 @@ A structured approach to:
 3. **Fix** bugs automatically via AI agent pipeline with review loops
 4. **Track** progress across hundreds of bugs with status dashboards
 
-The standard is language/framework agnostic. It has been battle-tested on a
-Python multi-repo project with 363 bugs fixed across 2 repositories.
+The standard is language/framework agnostic.
 
 ## Folder Structure
 

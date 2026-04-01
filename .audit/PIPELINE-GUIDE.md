@@ -1,7 +1,7 @@
 # Bug Fix Pipeline Guide
 
-Reference for building automated fix pipelines using Claude CLI + Codex CLI.
-Written from practical experience fixing 86+ bugs across a multi-repo Python ecosystem.
+Technical reference for building automated bug fix pipelines using Claude CLI + Codex CLI.
+Covers CLI syntax, script patterns, review loops, error handling, and practical tips.
 
 ## Architecture
 
@@ -397,13 +397,50 @@ Maintain a TRACKING.md with tables per severity:
 ```markdown
 | # | ID | Status |
 |---|-----|--------|
-| 1 | BUG-001 | ⏳ |
+| 1 | 001-MODULE-ID-short-description | ⏳ |
 ```
 
-Auto-update via regex substitution after each step.
+### Auto-update format
 
-**Gotcha:** Bug IDs in TRACKING.md must exactly match IDs in the script's
-`bug_ids` list, or the regex won't find them.
+The script's `bug_ids` list must use the **exact same IDs** as the TRACKING.md
+table rows. The regex replaces `⏳` with `✅` on the matching line:
+
+```python
+def update_tracking(bug_ids: list[str], status: str = "✅") -> None:
+    content = TRACKING.read_text()
+    for bid in bug_ids:
+        content = re.sub(
+            rf"(\| {re.escape(bid)} \|.*?)\⏳",
+            rf"\g<1>{status}",
+            content, count=1,
+        )
+    TRACKING.write_text(content)
+```
+
+**Critical rule:** The `bug_ids` in the STEPS definition must be the actual
+table row IDs (e.g., `"001-LOOP-001-policy-denial-budget-marks-completed"`),
+NOT shorthand like `"HIGH-001"`. The regex does an exact match against the
+table cell content.
+
+**Common mistake:** Using simplified IDs in the script that don't match the
+table. This causes silent no-ops — the tracking file never updates, giving
+the false impression that bugs are still pending.
+
+**Recommended pattern:**
+1. Generate TRACKING.md from the bug file names in `.audit/bugs/{severity}/`
+2. Use those same file names (minus `.md`) as the `bug_ids` in the script
+3. Test with a dry run: print which IDs matched and which didn't
+
+### Batch update (post-pipeline)
+
+If auto-update didn't work during the pipeline, update in bulk per severity:
+
+```python
+# Replace all ⏳ with ✅ within the High section only
+high_start = content.index("## High")
+medium_start = content.index("## Medium")
+content = content[:high_start] + content[high_start:medium_start].replace("⏳", "✅") + content[medium_start:]
+```
 
 ## Pre-flight Checklist
 
@@ -424,10 +461,10 @@ Before running the script:
   one review fix iteration. Worth every minute.
 - **5 iterations, not 3**: Complex bugs (regex bypasses, concurrency, protocol
   compliance) routinely need 3-4 iterations. Set MAX_REVIEW_ITERATIONS=5.
-- **Security bugs go deep**: SSRF protection required 5 iterations — Codex found
-  IPv4-mapped IPv6 bypasses, non-global IP ranges, documentation hostname whitelists,
-  and DNS rebinding vectors. Each iteration uncovered a new layer. Don't skimp on
-  iterations for security-critical fixes.
+- **Security bugs go deep**: SSRF, injection, and auth bypass fixes routinely need
+  4-5 iterations. The reviewer finds deeper bypass layers each time (e.g., IPv6-mapped
+  addresses, DNS rebinding, character encoding tricks). Don't skimp on iterations
+  for security-critical fixes.
 - **Review drift on later iterations**: After 3+ iterations, Codex may start finding
   issues tangential to the original bugs (e.g., pre-existing code smells, or claiming
   the fix "doesn't implement" changes that are in prior commits). This is noise —
@@ -456,11 +493,11 @@ Before running the script:
   to a shared function) can break 100+ tests across the repo. The fix agent sees
   "101 failures" and may struggle. Gap closure with focused prompts handles this
   better than the automated loop.
-- **Enterprise repos are harder**: More files, more cross-package dependencies,
-  stricter mypy. Expect enterprise steps to need more review iterations than core.
-- **Run gates between repo phases**: After finishing all core steps, run full quality
-  gates (ruff, mypy, pytest) before starting enterprise. This catches issues early
-  and gives you a clean baseline.
+- **Larger repos are harder**: More files, more cross-package dependencies,
+  stricter type checking. Expect steps in larger repos to need more review iterations.
+- **Run gates between repo phases**: After finishing all steps for one repo, run full
+  quality gates before starting the next repo. This catches issues early and gives
+  you a clean baseline.
 - **Coverage threshold gaps are normal**: Automated fixes may drop coverage by 0.01-0.05%
   due to new uncovered branches. This is trivial to fix manually and shouldn't block.
 
@@ -473,41 +510,34 @@ Before running the script:
   cleaner fixes instead of compatibility shims. Tell agents explicitly.
 - **WebSearch instructions work**: Agents actually use WebSearch to look up CWE/OWASP
   best practices. This improves fix quality measurably.
-- **Note CRIT fixes in HIGH prompts**: If critical bugs were fixed first, tell the
+- **Reference prior severity fixes**: If critical bugs were fixed first, tell the
   HIGH agents which files were already modified. This prevents duplicate work and
-  helps agents build on existing fixes (e.g., SSRF protection already added).
+  helps agents build on existing fixes.
 
 ### Pipeline Management
 - **Gap closure is a separate phase**: Don't try to fix everything in the automated
   loop. Collect remaining issues, batch them by repo, run focused manual fix→review
-  cycles. In our 76-bug campaign, gap closure was needed for 5 of 12 steps.
-- **Batch gaps across steps**: Combining gaps from steps 2+3+6 (core) or 9+11+12
-  (enterprise) into a single Codex session is more effective than fixing each
-  step's gaps separately. Codex sees the full picture and fixes interactions.
+  cycles. Expect ~40% of steps to need gap closure.
+- **Batch gaps across steps**: Combining gaps from multiple steps into a single
+  Codex session is more effective than fixing each step's gaps separately. Codex
+  sees the full picture and fixes interactions between changes.
 - **Script restartability is essential**: Always support `script.py START END` for
-  selective re-execution. You WILL need to restart failed steps. In our campaign,
-  we restarted steps 4-5 after an API outage, and ran 7-8 separately after gap
-  closure.
+  selective re-execution. You WILL need to restart failed steps due to API outages
+  or gap closure between batches.
 - **Track per-step verdicts**: Save the last review JSON verdict to a file per step.
   This makes gap collection trivial after the pipeline finishes.
 - **Monitor with periodic log checks**: The orchestrator log tells you everything.
   Tail it periodically or set up background pings.
 
-## Empirical Results (76-bug campaign)
+## Typical Performance
 
-From a real campaign fixing 76 HIGH-severity bugs across 2 Python repos:
+These numbers come from real-world campaigns and give a sense of what to expect:
 
-| Metric | Value |
-|--------|-------|
-| Total bugs fixed | 76 |
-| Total time | ~10.5 hours |
-| Steps | 12 (8 core + 4 enterprise) |
-| Total commits | ~52 |
-| Tests passing | 5,748 (3,629 core + 2,119 enterprise) |
-| Source files type-checked | 302 |
-| Steps needing review fixes | 12/12 (100%) |
-| Steps hitting max iterations | 5/12 (42%) |
-| Steps passing after gap closure | 12/12 (100%) |
-| Average step time (with review) | ~50 min |
-| Average Claude implementation time | ~15 min |
-| Average review iterations to PASS | 2.8 |
+| Metric | Typical Range |
+|--------|---------------|
+| Claude implementation time per step | 7-25 min |
+| Review iterations to PASS | 2-3 (up to 5 for security) |
+| Full step time (impl + review) | 30-60 min |
+| Steps needing review fixes | ~100% |
+| Steps hitting max iterations | ~40% |
+| Steps passing after gap closure | ~100% |
