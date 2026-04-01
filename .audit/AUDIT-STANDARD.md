@@ -252,7 +252,7 @@ for each step:
           │             │
           │             ▼
           │         goto step 2
-          │         (max 3 iterations)
+          │         (max 5 iterations)
           │
           ▼
        next step
@@ -293,6 +293,23 @@ The `--append-system-prompt` should set:
 
 ---
 
+## Phase 3.5: Gap Closure
+
+### Goal
+Close remaining issues from steps that hit the max review iteration limit.
+
+### Process
+1. Collect last review verdicts from steps that didn't reach PASS
+2. Batch related gaps (e.g., all regex issues together, all test gaps together)
+3. Run manual Codex fix → Codex review loop until PASS
+4. Restart any steps that failed due to API errors or timeouts
+
+> **Important:** Do not run gap closure in parallel with the main pipeline.
+> Both modify the same repo, causing conflicts and killed processes.
+> Wait for the pipeline to stop, fix gaps, then restart remaining steps.
+
+---
+
 ## Phase 4: Review & Hardening
 
 ### Goal
@@ -305,6 +322,7 @@ After all automated fixes, perform manual review and run full test suites.
 - [ ] Review git log — each commit message matches its changes
 - [ ] Spot-check 20% of fixes for correctness
 - [ ] Check for unintended side effects (new imports, changed APIs)
+- [ ] Verify steps that hit max review iterations have been gap-closed
 - [ ] Update TRACKING.md with final statuses
 - [ ] Identify follow-up items from review
 

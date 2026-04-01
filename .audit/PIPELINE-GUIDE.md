@@ -1,7 +1,7 @@
 # Bug Fix Pipeline Guide
 
 Reference for building automated fix pipelines using Claude CLI + Codex CLI.
-Written from practical experience fixing 86 bugs across protocore ecosystem.
+Written from practical experience fixing 86+ bugs across a multi-repo Python ecosystem.
 
 ## Architecture
 
@@ -12,8 +12,13 @@ fix-script.py
   |   1. Claude Opus 4.6 (high) -- implements fix + tests + commit
   |   2. Codex GPT-5.4 -- reviews the commit (JSON verdict)
   |   3. if FAIL: Codex GPT-5.4 -- fixes issues + commit
-  |   4. goto 2 (max 3 iterations)
+  |   4. goto 2 (max 5 iterations)
   |   5. next step
+  |
+  after all steps:
+  |   - collect unfixed gaps from steps that hit max iterations
+  |   - run manual Codex fix→review loop for each gap batch
+  |   - restart failed/skipped steps
 ```
 
 ## CLI Reference
@@ -75,12 +80,12 @@ Key flags:
 
 ### Proxy
 
-Both tools inherit proxy from environment. Ensure these are set:
+Both tools inherit proxy from environment. If you need a proxy, set all four variants:
 ```bash
-export http_proxy=http://127.0.0.1:10809
-export https_proxy=http://127.0.0.1:10809
-export HTTP_PROXY=http://127.0.0.1:10809
-export HTTPS_PROXY=http://127.0.0.1:10809
+export http_proxy=http://HOST:PORT
+export https_proxy=http://HOST:PORT
+export HTTP_PROXY=http://HOST:PORT
+export HTTPS_PROXY=http://HOST:PORT
 ```
 
 Pass env to subprocess: `env=os.environ.copy()`
@@ -90,44 +95,56 @@ Pass env to subprocess: `env=os.environ.copy()`
 ### 1. Configuration Block
 
 ```python
-WORKSPACE = Path("/home/dev/ascorblack-labs")
-LOG_DIR = WORKSPACE / ".audit" / "fix-logs-<name>"
+WORKSPACE = Path("/path/to/your/workspace")
+LOG_DIR = WORKSPACE / ".audit" / "fix-logs-<severity>"
 TRACKING = WORKSPACE / ".audit" / "TRACKING.md"
 
 CLAUDE_BIN = "claude"
-CLAUDE_MODEL = "claude-opus-4-6"
+CLAUDE_MODEL = "claude-opus-4-6"      # or latest available
 CLAUDE_EFFORT = "high"
-STEP_TIMEOUT = 3000  # 50 min per step
+STEP_TIMEOUT = 3000                    # 50 min per step
 
 CODEX_BIN = "codex"
-CODEX_MODEL = "gpt-5.4"
-CODEX_REVIEW_TIMEOUT = 600   # 10 min for review
-CODEX_FIX_TIMEOUT = 1800     # 30 min for fix
-MAX_REVIEW_ITERATIONS = 3
+CODEX_MODEL = "gpt-5.4"               # or latest available
+CODEX_REVIEW_TIMEOUT = 600            # 10 min for review
+CODEX_FIX_TIMEOUT = 1800              # 30 min for fix
+MAX_REVIEW_ITERATIONS = 5             # 5 is the sweet spot (3 is too few)
 ```
+
+> **Why 5 iterations, not 3?** In practice, ~60% of steps need at least 1 review
+> fix. Complex steps (security, concurrency) often need 3 iterations to fully
+> close. With only 3 max, the pipeline exits with unresolved gaps that require
+> manual intervention. 5 iterations covers virtually all cases.
 
 ### 2. System Prompt (appended to Claude)
 
 ```python
 APPEND_SYSTEM = """\
-You are a senior software engineer fixing {SEVERITY} bugs in Protocore.
+You are a senior software engineer fixing {SEVERITY} bugs in {PROJECT_NAME}.
+
+{# Include backward-compat note if applicable: #}
+IMPORTANT: No backward compatibility required. This is a dev-version.
+Make clean, breaking changes where needed.
 
 Mandatory workflow:
 1. Read ALL bug report files listed in the task.
 2. Read affected source files and existing tests.
-3. Research best practices: WebSearch CWE/OWASP IDs.
-4. Implement fix following existing code style.
-5. Write comprehensive tests.
-6. Run pytest, ruff, mypy. Fix ALL issues.
-7. Update broken tests if they relied on buggy behavior.
-8. Git commit with descriptive message.
+3. Research best practices: WebSearch CWE/OWASP IDs from the bug reports.
+4. Check if any previously committed fixes partially address the issue.
+5. Implement fix following existing code style. Minimal, targeted changes.
+6. Write comprehensive tests covering the bug AND the fix.
+7. Run {test_cmd}, {lint_cmd}, {typecheck_cmd}. Fix ALL issues.
+8. Update broken tests if they relied on buggy behavior.
+9. Git commit with descriptive message.
 
 Key info:
-- protocore/ (core): cd protocore && uv run pytest/ruff/mypy
-- protocore-enterprise/: cd protocore-enterprise && uv run pytest/ruff/mypy
-- Python 3.12+, strict mypy, ruff, uv
+{# Project-specific commands and conventions here #}
 """
 ```
+
+> **Tip:** Step 4 ("check previously committed fixes") is critical when running
+> batches sequentially. Later agents need to know what earlier agents already
+> changed, especially in shared files like safety policies or config resolvers.
 
 ### 3. Step Prompt Template
 
@@ -221,7 +238,7 @@ def review_and_fix_loop(name, bug_ids):
         if verdict["pass"]:
             return  # clean
         codex_fix(name, bug_ids, verdict["issues"])
-    # max iterations reached — move on
+    # max iterations reached — move on, collect gaps for later
 ```
 
 ### 7. Step Execution
@@ -232,6 +249,32 @@ for step_name, prompt, bug_ids in STEPS:
     if success:
         review_and_fix_loop(step_name, bug_ids)
 ```
+
+### 8. Gap Closure (post-pipeline)
+
+Steps that hit max iterations leave unresolved issues. After the main pipeline:
+
+1. **Collect gaps**: Read the last `*-review-output.txt` for each step that hit max iterations
+2. **Batch related gaps**: Combine gaps from multiple steps into one fix prompt
+3. **Manual review loop**: Run Codex fix → Codex review → repeat until PASS
+4. **Restart failed steps**: If any steps failed (API errors, timeouts), restart them
+
+```python
+# Collect remaining issues from review output files
+gaps = []
+for step_name in steps_with_max_iterations:
+    verdict_file = LOG_DIR / f"{step_name}-review-output.txt"
+    verdict = json.loads(verdict_file.read_text())
+    if not verdict["pass"]:
+        gaps.extend(verdict["issues"])
+
+# Fix all gaps in one Codex session, then review
+# Repeat until PASS (manual loop, not the automated script)
+```
+
+> **Why separate gap closure?** The automated loop has a fixed iteration budget.
+> Some issues (complex concurrency, subtle regex bypasses) need more focused
+> attention. The gap closure phase gives unlimited iterations with human oversight.
 
 ## Bug Grouping Strategy
 
@@ -245,13 +288,52 @@ Sequential execution eliminates cross-batch conflicts.
 
 ## Timeouts (empirical)
 
-| Operation | Timeout | Notes |
-|-----------|---------|-------|
-| Claude fix (4-6 bugs) | 50 min | Includes research, impl, tests, validation |
-| Claude fix (7-10 bugs) | 50 min | Same — agent parallelizes internally |
-| Codex review | 10 min | Reads diff, runs checks, outputs JSON |
-| Codex fix | 30 min | Implements review feedback, runs tests |
-| Full step with review | ~50-70 min | Fix + 1-2 review cycles typical |
+| Operation | Timeout | Typical | Notes |
+|-----------|---------|---------|-------|
+| Claude fix (4-6 bugs) | 50 min | 10-20 min | Research + impl + tests + validation |
+| Claude fix (7-10 bugs) | 50 min | 15-25 min | Agent parallelizes internally |
+| Codex review | 10 min | 3-5 min | Reads diff, runs checks, outputs JSON |
+| Codex fix | 30 min | 5-15 min | Implements review feedback, runs tests |
+| Full step with review | — | 30-60 min | Fix + 2-3 review cycles typical |
+
+## Error Handling & Restartability
+
+### API Errors (HTTP 500)
+LLM API providers have transient outages. The script should:
+- **Continue on failure**: Don't abort the whole pipeline when one step fails
+- **Log the error clearly**: Distinguish API errors from agent failures
+- **Support range restart**: `python3 script.py START END` to rerun specific steps
+
+```python
+# In run_step, capture and log API errors specifically
+if "API Error: 500" in result.stdout:
+    log(f"API outage during {name} — restart this step later")
+```
+
+### Uncommitted Changes After Failure
+If Claude crashes mid-step (API error, timeout), it may leave uncommitted changes:
+- **Check**: `git diff --stat HEAD` after each failure
+- **Decision**: If changes look complete, commit manually. If partial, discard with `git checkout -- .`
+- **Rule of thumb**: If the commit message was in the prompt and files match the expected changes, commit it
+
+### Avoiding Parallel Conflicts
+**Never run two agents in the same repo simultaneously.** This includes:
+- Codex "rescue" tasks fixing gaps while the main pipeline runs
+- Manual edits while the pipeline is active
+
+If you need to fix gaps from earlier steps while later steps run,
+**wait for the pipeline to pause/complete first**.
+
+### Script Supports Selective Re-execution
+Design the script to accept step ranges:
+```bash
+python3 script.py           # all steps
+python3 script.py 4         # from step 4 onwards
+python3 script.py 4 5       # only steps 4 and 5
+python3 script.py 7 8       # only steps 7 and 8
+```
+
+This allows surgical reruns after API failures or gap closure.
 
 ## Logging
 
@@ -292,17 +374,46 @@ Before running the script:
 
 ## Lessons Learned
 
+### Review Loop
 - **Codex finds real gaps**: The review loop catches incomplete fixes, missing edge
-  cases, and quality gate failures that Claude missed. Worth the extra time.
-- **3 review iterations is enough**: Most issues resolve in 1-2 cycles. If still
-  failing at 3, the bug is likely too complex for automated fixing.
-- **Timeouts are forgiving**: 50 min for Claude is generous. Most steps finish in
-  15-25 min. Timeouts exist for edge cases, not the norm.
+  cases, and quality gate failures that Claude missed. ~60% of steps need at least
+  one review fix iteration. Worth every minute.
+- **5 iterations, not 3**: Complex bugs (regex bypasses, concurrency, protocol
+  compliance) routinely need 3-4 iterations. Set MAX_REVIEW_ITERATIONS=5.
+- **Review drift on later iterations**: After 3+ iterations, Codex may start finding
+  issues tangential to the original bugs (e.g., pre-existing code smells). This is
+  noise — the gap closure phase handles these better with focused prompts.
+- **Review is strict but not always right**: Codex may claim a fix is incomplete
+  based on a theoretical bypass. Verify its claims before trusting blindly.
+
+### Execution
+- **API outages happen**: HTTP 500 from Anthropic/OpenAI is transient. Steps fail
+  instantly (9s exit) or mid-work (10+ min then crash). Always design for restart.
 - **Agent commits even on timeout**: If Claude times out but already committed, the
-  work is preserved. Check git log after timeouts.
-- **Sequential > parallel**: For bugs in the same repo, sequential execution avoids
-  merge conflicts and lets each agent see prior fixes.
+  work is preserved. Always check `git log` after timeouts.
+- **Uncommitted changes on crash**: If API crashes mid-step, check `git diff --stat`.
+  The agent may have written good changes but not reached the commit command.
+- **Never run parallel agents in same repo**: Codex "rescue" tasks + main pipeline
+  in the same git repo = file conflicts and killed processes. Sequential only.
+- **50 min timeout is generous**: Most Claude steps finish in 10-25 min. The timeout
+  exists for edge cases (large files, slow web searches).
+
+### Prompt Design
 - **Prompt specificity matters**: The more specific the fix instructions (exact
   function names, line numbers, code patterns), the better the output.
+- **Include "check previous fixes" step**: When running sequential batches, later
+  agents need to know what earlier agents changed in shared files.
 - **No backward compat = faster fixes**: When breaking changes are OK, agents make
   cleaner fixes instead of compatibility shims.
+- **WebSearch instructions work**: Agents actually use WebSearch to look up CWE/OWASP
+  best practices. This improves fix quality measurably.
+
+### Pipeline Management
+- **Gap closure is a separate phase**: Don't try to fix everything in the automated
+  loop. Collect remaining issues, batch them, run focused manual fix→review cycles.
+- **Script restartability is essential**: Always support `script.py START END` for
+  selective re-execution. You WILL need to restart failed steps.
+- **Track per-step verdicts**: Save the last review JSON verdict to a file per step.
+  This makes gap collection trivial after the pipeline finishes.
+- **Monitor with periodic log checks**: The orchestrator log tells you everything.
+  Tail it periodically or set up background pings.
