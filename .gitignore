@@ -1,0 +1,13 @@
+# Logs from pipeline runs (generated, not tracked)
+.audit/fix-logs*/
+.audit/*.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
