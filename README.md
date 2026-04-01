@@ -98,7 +98,7 @@ This catches bugs that a single model would miss. In practice, ~60% of steps req
 
 ## Real-World Results
 
-Built and tested on the [Protocore](https://github.com/ascorblack) ecosystem:
+Built and tested on the [Protocore](https://github.com/ascorblack-labs) ecosystem:
 
 - **363 bugs found** across 2 Python repositories (10 Critical, 76 High, 245 Medium, 32 Low)
 - **86 bugs fixed** automatically (10 Critical + 76 High)
