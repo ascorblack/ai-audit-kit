@@ -109,6 +109,7 @@ CODEX_MODEL = "gpt-5.4"               # or latest available
 CODEX_REVIEW_TIMEOUT = 600            # 10 min for review
 CODEX_FIX_TIMEOUT = 1800              # 30 min for fix
 MAX_REVIEW_ITERATIONS = 5             # 5 is the sweet spot (3 is too few)
+MAX_FIX_ATTEMPTS = 3                  # retry fix on non-zero exit
 ```
 
 > **Why 5 iterations, not 3?** In practice, ~60% of steps need at least 1 review
@@ -232,14 +233,31 @@ Fix ALL issues. Then:
 ### 6. Review Loop
 
 ```python
+def codex_fix(name, bug_ids, issues):
+    """Fix with retry — Codex can fail (exit=1) on complex multi-file changes."""
+    for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
+        result = run_codex(...)
+        if result.returncode == 0:
+            return True
+        log(f"Attempt {attempt} failed, retrying...")
+    return False
+
 def review_and_fix_loop(name, bug_ids):
     for i in range(1, MAX_ITERATIONS + 1):
         verdict = codex_review(name, bug_ids)  # returns {"pass": bool, "issues": [...]}
         if verdict["pass"]:
             return  # clean
-        codex_fix(name, bug_ids, verdict["issues"])
+        fixed = codex_fix(name, bug_ids, verdict["issues"])
+        if not fixed:
+            continue  # DON'T stop — next review may find partial fix sufficient
     # max iterations reached — move on, collect gaps for later
 ```
+
+> **Critical: never stop on fix failure.** Codex `exec` can exit non-zero due to
+> tool errors, network issues, or hitting complexity limits. Retrying (up to 3
+> attempts) often succeeds. Even if all retries fail, the next review iteration
+> gives a fresh chance — the partial changes from the failed attempt may have
+> improved the codebase enough for the next review to pass or find fewer issues.
 
 ### 7. Step Execution
 
@@ -315,6 +333,20 @@ If Claude crashes mid-step (API error, timeout), it may leave uncommitted change
 - **Check**: `git diff --stat HEAD` after each failure
 - **Decision**: If changes look complete, commit manually. If partial, discard with `git checkout -- .`
 - **Rule of thumb**: If the commit message was in the prompt and files match the expected changes, commit it
+
+### Codex Fix Failures (exit=1)
+Codex `exec` can fail with exit code 1 due to:
+- Too many lint/type errors to fix in one session
+- Network issues mid-execution
+- Complexity limits (too many files to modify)
+
+**Always retry:** Set `MAX_FIX_ATTEMPTS = 3`. Each retry is a fresh session
+that sees the state left by the previous attempt. Even partial progress
+compounds — attempt 2 starts from a better state than attempt 1.
+
+**Never stop the review loop on fix failure:** Continue to the next review
+iteration. The partial changes may be sufficient, or the reviewer may find
+fewer issues on the next pass.
 
 ### Avoiding Parallel Conflicts
 **Never run two agents in the same repo simultaneously.** This includes:
