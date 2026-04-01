@@ -92,18 +92,21 @@ The fix pipeline uses a two-model approach for defense in depth:
 
 - **Claude Opus 4.6** (implementer) — reads bug reports, researches best practices, writes fixes and tests, commits
 - **Codex GPT-5.4** (reviewer) — reviews each commit, finds gaps, returns structured JSON verdict
-- **Review loop** — if the reviewer finds issues, it fixes them itself, then re-reviews (up to 3 iterations)
+- **Review loop** — if the reviewer finds issues, it fixes them itself, then re-reviews (up to 5 iterations)
+- **Gap closure** — issues that survive max iterations are batched and fixed in focused post-pipeline sessions
 
-This catches bugs that a single model would miss. In practice, ~60% of steps require at least one review fix iteration.
+This catches bugs that a single model would miss. In practice, 100% of steps required at least one review fix. The reviewer found real security bypasses (IPv6-mapped SSRF, regex evasion, interpreter aliasing) that the implementer missed.
 
 ## Real-World Results
 
 Built and tested on the [Protocore](https://github.com/ascorblack-labs) ecosystem:
 
 - **363 bugs found** across 2 Python repositories (10 Critical, 76 High, 245 Medium, 32 Low)
-- **86 bugs fixed** automatically (10 Critical + 76 High)
-- **~250 tests written** by the pipeline
-- **Review loop** caught incomplete fixes in ~60% of steps
+- **86 bugs fixed** automatically (10 Critical + 76 High) in ~10.5 hours
+- **5,748 tests passing** across both repos (0 failures)
+- **302 source files** type-checked with 0 errors
+- **~52 commits** generated (implementation + review fixes)
+- **Review loop** caught real issues in 100% of steps; avg 2.8 iterations to PASS
 
 ## Customization
 

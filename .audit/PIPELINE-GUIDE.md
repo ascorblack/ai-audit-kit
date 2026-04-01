@@ -301,8 +301,15 @@ Group bugs by:
 2. **Shared files** — bugs touching the same file MUST be in the same batch
 3. **Domain** — related functionality together (shell safety, subagent, etc.)
 4. **Size** — 4-8 bugs per batch (sweet spot for 50-min timeout)
+5. **Complexity** — security bugs (SSRF, injection) generate more review iterations than correctness bugs; plan accordingly
 
 Sequential execution eliminates cross-batch conflicts.
+
+### Recommended execution order
+Run all steps for one repo before moving to the next. This allows you to:
+- Run quality gates on repo A while repo B steps are executing
+- Fix gaps from repo A steps without conflicting with ongoing repo B work
+- Catch transitive failures early (one fix breaking another module's tests)
 
 ## Timeouts (empirical)
 
@@ -372,12 +379,17 @@ This allows surgical reruns after API failures or gap closure.
 Store per-step logs + review logs:
 ```
 .audit/fix-logs-high/
-  orchestrator.log          # timestamped status lines
-  step-01-name.log          # Claude stdout/stderr
-  step-01-name-review.log   # Codex review stdout
-  step-01-name-review-output.txt  # Codex JSON verdict
-  step-01-name-fix.log      # Codex fix stdout
+  orchestrator.log                   # timestamped status lines
+  step-01-name.log                   # Claude stdout/stderr
+  step-01-name-review.log            # Codex review stdout
+  step-01-name-review-output.txt     # Codex JSON verdict (last iteration)
+  step-01-name-fix-attempt1.log      # Codex fix attempt 1
+  step-01-name-fix-attempt2.log      # Codex fix attempt 2 (if retry)
 ```
+
+> **Tip:** Use per-attempt fix log files (not overwrite). This preserves the
+> full history of what each attempt tried, which is invaluable for debugging
+> why a step hit max iterations.
 
 ## Tracking
 
@@ -412,23 +424,45 @@ Before running the script:
   one review fix iteration. Worth every minute.
 - **5 iterations, not 3**: Complex bugs (regex bypasses, concurrency, protocol
   compliance) routinely need 3-4 iterations. Set MAX_REVIEW_ITERATIONS=5.
+- **Security bugs go deep**: SSRF protection required 5 iterations — Codex found
+  IPv4-mapped IPv6 bypasses, non-global IP ranges, documentation hostname whitelists,
+  and DNS rebinding vectors. Each iteration uncovered a new layer. Don't skimp on
+  iterations for security-critical fixes.
 - **Review drift on later iterations**: After 3+ iterations, Codex may start finding
-  issues tangential to the original bugs (e.g., pre-existing code smells). This is
-  noise — the gap closure phase handles these better with focused prompts.
+  issues tangential to the original bugs (e.g., pre-existing code smells, or claiming
+  the fix "doesn't implement" changes that are in prior commits). This is noise —
+  the gap closure phase handles these better with focused prompts.
 - **Review is strict but not always right**: Codex may claim a fix is incomplete
   based on a theoretical bypass. Verify its claims before trusting blindly.
 
 ### Execution
 - **API outages happen**: HTTP 500 from Anthropic/OpenAI is transient. Steps fail
   instantly (9s exit) or mid-work (10+ min then crash). Always design for restart.
+  Consecutive steps may both fail if the outage lasts several minutes.
 - **Agent commits even on timeout**: If Claude times out but already committed, the
   work is preserved. Always check `git log` after timeouts.
 - **Uncommitted changes on crash**: If API crashes mid-step, check `git diff --stat`.
   The agent may have written good changes but not reached the commit command.
+  Discard with `git checkout -- .` if partial, or commit manually if complete.
 - **Never run parallel agents in same repo**: Codex "rescue" tasks + main pipeline
   in the same git repo = file conflicts and killed processes. Sequential only.
-- **50 min timeout is generous**: Most Claude steps finish in 10-25 min. The timeout
+- **50 min timeout is generous**: Most Claude steps finish in 7-25 min. The timeout
   exists for edge cases (large files, slow web searches).
+- **Worktree pollution**: Codex may create git worktrees during review (e.g., in
+  `/tmp/`). Clean up after the pipeline: `git worktree list` + `git worktree remove`.
+
+### Quality Gates
+- **Transitive failures cascade**: One bad change (e.g., adding a required parameter
+  to a shared function) can break 100+ tests across the repo. The fix agent sees
+  "101 failures" and may struggle. Gap closure with focused prompts handles this
+  better than the automated loop.
+- **Enterprise repos are harder**: More files, more cross-package dependencies,
+  stricter mypy. Expect enterprise steps to need more review iterations than core.
+- **Run gates between repo phases**: After finishing all core steps, run full quality
+  gates (ruff, mypy, pytest) before starting enterprise. This catches issues early
+  and gives you a clean baseline.
+- **Coverage threshold gaps are normal**: Automated fixes may drop coverage by 0.01-0.05%
+  due to new uncovered branches. This is trivial to fix manually and shouldn't block.
 
 ### Prompt Design
 - **Prompt specificity matters**: The more specific the fix instructions (exact
@@ -436,16 +470,44 @@ Before running the script:
 - **Include "check previous fixes" step**: When running sequential batches, later
   agents need to know what earlier agents changed in shared files.
 - **No backward compat = faster fixes**: When breaking changes are OK, agents make
-  cleaner fixes instead of compatibility shims.
+  cleaner fixes instead of compatibility shims. Tell agents explicitly.
 - **WebSearch instructions work**: Agents actually use WebSearch to look up CWE/OWASP
   best practices. This improves fix quality measurably.
+- **Note CRIT fixes in HIGH prompts**: If critical bugs were fixed first, tell the
+  HIGH agents which files were already modified. This prevents duplicate work and
+  helps agents build on existing fixes (e.g., SSRF protection already added).
 
 ### Pipeline Management
 - **Gap closure is a separate phase**: Don't try to fix everything in the automated
-  loop. Collect remaining issues, batch them, run focused manual fix→review cycles.
+  loop. Collect remaining issues, batch them by repo, run focused manual fix→review
+  cycles. In our 76-bug campaign, gap closure was needed for 5 of 12 steps.
+- **Batch gaps across steps**: Combining gaps from steps 2+3+6 (core) or 9+11+12
+  (enterprise) into a single Codex session is more effective than fixing each
+  step's gaps separately. Codex sees the full picture and fixes interactions.
 - **Script restartability is essential**: Always support `script.py START END` for
-  selective re-execution. You WILL need to restart failed steps.
+  selective re-execution. You WILL need to restart failed steps. In our campaign,
+  we restarted steps 4-5 after an API outage, and ran 7-8 separately after gap
+  closure.
 - **Track per-step verdicts**: Save the last review JSON verdict to a file per step.
   This makes gap collection trivial after the pipeline finishes.
 - **Monitor with periodic log checks**: The orchestrator log tells you everything.
   Tail it periodically or set up background pings.
+
+## Empirical Results (76-bug campaign)
+
+From a real campaign fixing 76 HIGH-severity bugs across 2 Python repos:
+
+| Metric | Value |
+|--------|-------|
+| Total bugs fixed | 76 |
+| Total time | ~10.5 hours |
+| Steps | 12 (8 core + 4 enterprise) |
+| Total commits | ~52 |
+| Tests passing | 5,748 (3,629 core + 2,119 enterprise) |
+| Source files type-checked | 302 |
+| Steps needing review fixes | 12/12 (100%) |
+| Steps hitting max iterations | 5/12 (42%) |
+| Steps passing after gap closure | 12/12 (100%) |
+| Average step time (with review) | ~50 min |
+| Average Claude implementation time | ~15 min |
+| Average review iterations to PASS | 2.8 |
